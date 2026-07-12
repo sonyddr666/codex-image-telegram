@@ -135,8 +135,16 @@ não o coloque no Git e não o exponha em logs.
 | `/limpar` | limpa o histórico de chat em memória |
 | `/imagem <prompt>` | gera uma imagem |
 | `/imagem <n> <prompt>` | gera até cinco imagens |
+| `/imagem auto <prompt>` | gera imediatamente em 1536x1024, qualidade e fundo automáticos |
+| `/imagem auto <n> <prompt>` | mesmo modo automático, gerando até cinco imagens |
 
 Envie uma foto para iniciar edição. O bot pede prompt, tamanho, qualidade e fundo.
+
+Exemplo sem abrir os menus de configuração:
+
+```text
+/imagem auto uma cidade futurista ao pôr do sol
+```
 
 ## Validação local
 
