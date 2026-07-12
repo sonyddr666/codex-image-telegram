@@ -579,7 +579,1098 @@ def renew_tokens(refresh_token: str) -> TokenBundle:
 
 # ---------------------------------------------------------------------------
 # Contas, quota e cliente Codex
-# -----------------------------------------------…10445 tokens truncated…end_text(
+# ---------------------------------------------------------------------------
+
+
+def to_epoch_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number / 1000.0 if number > 1_000_000_000_000 else number
+
+
+def format_remaining(timestamp: float | None) -> str:
+    if timestamp is None:
+        return "não informado"
+    seconds = int(timestamp - time.time())
+    if seconds <= 0:
+        return "agora"
+    days, seconds = divmod(seconds, 86_400)
+    hours, seconds = divmod(seconds, 3_600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def walk_dicts(value: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[tuple[str, ...], dict[str, Any]]]:
+    if isinstance(value, dict):
+        yield path, value
+        for key, child in value.items():
+            yield from walk_dicts(child, path + (str(key).lower(),))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from walk_dicts(child, path + (str(index),))
+
+
+def parse_quota(body: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "plan": body.get("plan_type") or body.get("planType") or "-",
+    }
+    windows: list[dict[str, Any]] = []
+
+    for path, node in walk_dicts(body):
+        used = node.get("used_percent", node.get("usedPercent"))
+        left = node.get("percent_left", node.get("percentLeft"))
+        try:
+            if left is not None:
+                remaining = float(left)
+            elif used is not None:
+                remaining = 100.0 - float(used)
+            else:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        reset = (
+            node.get("reset_at")
+            or node.get("resetsAt")
+            or node.get("reset_time_ms")
+        )
+        if reset is None and node.get("reset_after_seconds") is not None:
+            try:
+                reset = time.time() + float(node["reset_after_seconds"])
+            except (TypeError, ValueError):
+                reset = None
+
+        duration_seconds: float | None = None
+        duration = node.get("limit_window_seconds")
+        if duration is not None:
+            try:
+                duration_seconds = float(duration)
+            except (TypeError, ValueError):
+                pass
+        if duration_seconds is None and node.get("windowDurationMins") is not None:
+            try:
+                duration_seconds = float(node["windowDurationMins"]) * 60
+            except (TypeError, ValueError):
+                pass
+
+        windows.append(
+            {
+                "remaining": max(0.0, min(100.0, remaining)),
+                "reset": to_epoch_seconds(reset),
+                "duration": duration_seconds,
+                "path": ".".join(path),
+            }
+        )
+
+    def pick(names: tuple[str, ...], long_window: bool) -> dict[str, Any] | None:
+        named = [item for item in windows if any(name in item["path"] for name in names)]
+        if named:
+            return named[0]
+        with_duration = [item for item in windows if item["duration"] is not None]
+        if not with_duration:
+            return None
+        return max(with_duration, key=lambda item: item["duration"]) if long_window else min(
+            with_duration, key=lambda item: item["duration"]
+        )
+
+    five_hour = pick(("primary_window", "primary"), long_window=False)
+    weekly = pick(("secondary_window", "secondary", "weekly"), long_window=True)
+    if five_hour is None and windows:
+        five_hour = windows[0]
+    if weekly is None and len(windows) > 1:
+        weekly = windows[1]
+
+    if five_hour:
+        result["five_hour_pct"] = five_hour["remaining"]
+        result["five_hour_reset"] = five_hour["reset"]
+    if weekly and weekly is not five_hour:
+        result["weekly_pct"] = weekly["remaining"]
+        result["weekly_reset"] = weekly["reset"]
+    return result
+
+
+class CodexAccount:
+    def __init__(self, bundle: TokenBundle, auth_file: Path, label: str | None = None):
+        self.access_token = bundle.access_token
+        self.refresh_token = bundle.refresh_token
+        self.id_token = bundle.id_token
+        self.account_id = bundle.account_id or jwt_account_id(bundle.access_token) or None
+        self.auth_file = auth_file
+        self.label = label or bundle.label or auth_file.stem
+        self._refresh_lock = threading.Lock()
+        self._refresh_properties()
+
+    def _refresh_properties(self) -> None:
+        self.email = jwt_email(self.access_token) or jwt_email(self.id_token) or "não informado"
+        self.plan_type = jwt_plan_type(self.access_token)
+        if self.plan_type == "personal" and self.id_token:
+            self.plan_type = jwt_plan_type(self.id_token)
+        self.expires_at = jwt_expiration(self.access_token)
+
+    @property
+    def identity(self) -> str:
+        return TokenBundle(
+            access_token=self.access_token,
+            refresh_token=self.refresh_token,
+            id_token=self.id_token,
+            account_id=self.account_id,
+        ).identity
+
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "originator": OAUTH_ORIGINATOR,
+        }
+        if self.account_id:
+            headers["ChatGPT-Account-ID"] = self.account_id
+        return headers
+
+    def refresh(self, force: bool = False) -> bool:
+        with self._refresh_lock:
+            if not force and not is_token_expired(self.access_token):
+                return True
+            if not self.refresh_token:
+                return False
+            old_access = self.access_token
+            try:
+                bundle = renew_tokens(self.refresh_token)
+            except UserVisibleError as exc:
+                logger.warning("Falha ao renovar %s: %s", self.label, safe_exception(exc))
+                return False
+            self.access_token = bundle.access_token
+            self.refresh_token = bundle.refresh_token or self.refresh_token
+            self.id_token = bundle.id_token or self.id_token
+            self.account_id = bundle.account_id or self.account_id
+            self._refresh_properties()
+            update_tokens_in_auth_file(
+                self.auth_file,
+                old_access,
+                TokenBundle(
+                    access_token=self.access_token,
+                    refresh_token=self.refresh_token,
+                    id_token=self.id_token,
+                    account_id=self.account_id,
+                    label=self.label,
+                ),
+            )
+            return True
+
+    def ensure_valid(self) -> None:
+        if is_token_expired(self.access_token) and not self.refresh(force=True):
+            raise UserVisibleError("a sessão da conta expirou; faça login ou importe auth.json novamente")
+
+    def check_quota(self) -> dict[str, Any]:
+        for attempt in range(2):
+            self.ensure_valid()
+            try:
+                response = requests.get(
+                    QUOTA_ENDPOINT,
+                    headers=self.headers,
+                    timeout=(10, 30),
+                )
+            except requests.RequestException as exc:
+                return {"error": safe_exception(exc)}
+            if response.status_code == 401 and attempt == 0 and self.refresh(force=True):
+                continue
+            if response.ok:
+                try:
+                    body = response.json()
+                except ValueError:
+                    return {"error": "resposta de quota inválida"}
+                return parse_quota(body) if isinstance(body, dict) else {"error": "resposta de quota inválida"}
+            return {"error": str(response_error(response, "falha ao consultar quota"))}
+        return {"error": "não foi possível autenticar a conta"}
+
+
+class AuthManager:
+    def load_accounts(self) -> list[CodexAccount]:
+        accounts: list[CodexAccount] = []
+        for auth_file in discover_auth_files():
+            try:
+                data = read_auth_json(auth_file)
+                bundles = extract_token_bundles(data)
+            except (OSError, ValueError, UserVisibleError) as exc:
+                logger.warning("Ignorando %s: %s", auth_file.name, safe_exception(exc))
+                continue
+            for index, bundle in enumerate(bundles, start=1):
+                label = bundle.label or auth_file.stem
+                if len(bundles) > 1:
+                    label = f"{label} #{index}"
+                accounts.append(CodexAccount(bundle, auth_file, label))
+        return accounts
+
+    def find(self, identity: str | None) -> CodexAccount | None:
+        if not identity:
+            return None
+        return next((account for account in self.load_accounts() if account.identity == identity), None)
+
+
+def extract_response_text(value: Any) -> str:
+    parts: list[str] = []
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            parts.append(value["text"])
+        for key in ("output", "content", "response"):
+            if key in value:
+                nested = extract_response_text(value[key])
+                if nested:
+                    parts.append(nested)
+    elif isinstance(value, list):
+        for item in value:
+            nested = extract_response_text(item)
+            if nested:
+                parts.append(nested)
+    return "".join(parts)
+
+
+class CodexClient:
+    def __init__(self, account: CodexAccount, base_url: str = CODEX_BASE_URL):
+        self.account = account
+        self.base_url = base_url.rstrip("/")
+
+    def headers(self, streaming: bool = False) -> dict[str, str]:
+        headers = self.account.headers.copy()
+        headers["Accept"] = "text/event-stream" if streaming else "application/json"
+        return headers
+
+    @staticmethod
+    def build_input(history: list[dict[str, str]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for message in history[-MAX_HISTORY_MESSAGES:]:
+            text = str(message.get("content", "")).strip()
+            if not text:
+                continue
+            role = "assistant" if message.get("role") == "assistant" else "user"
+            result.append(
+                {
+                    "type": "message",
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "output_text" if role == "assistant" else "input_text",
+                            "text": text,
+                        }
+                    ],
+                }
+            )
+        return result
+
+    def chat(self, model: str, history: list[dict[str, str]], system_prompt: str = SYSTEM_PROMPT) -> str:
+        payload = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": self.build_input(history),
+            "store": False,
+            "stream": True,
+        }
+
+        for attempt in range(2):
+            self.account.ensure_valid()
+            try:
+                response = requests.post(
+                    f"{self.base_url}/responses",
+                    headers=self.headers(streaming=True),
+                    json=payload,
+                    stream=True,
+                    timeout=(15, 180),
+                )
+            except requests.RequestException as exc:
+                raise UserVisibleError(f"falha no chat: {safe_exception(exc)}") from exc
+
+            with response:
+                if response.status_code == 401 and attempt == 0 and self.account.refresh(force=True):
+                    continue
+                if not response.ok:
+                    raise response_error(response, "falha no chat Codex")
+
+                deltas: list[str] = []
+                completed_text = ""
+                for raw_line in response.iter_lines(decode_unicode=False):
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if not line.startswith("data:"):
+                        continue
+                    raw_event = line[5:].strip()
+                    if not raw_event or raw_event == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(raw_event)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
+                        deltas.append(event["delta"])
+                    elif event_type == "response.completed":
+                        completed_text = extract_response_text(event.get("response"))
+                    elif event_type in {"response.failed", "response.incomplete", "error"}:
+                        error = event.get("error") or event.get("response") or "resposta incompleta"
+                        if isinstance(error, dict):
+                            error = error.get("message") or error.get("code") or "resposta incompleta"
+                        raise UserVisibleError(f"o modelo não concluiu a resposta: {redact_secrets(error)}")
+
+                answer = "".join(deltas).strip() or completed_text.strip()
+                if not answer:
+                    raise UserVisibleError("o modelo terminou sem retornar texto")
+                return answer
+
+        raise UserVisibleError("não foi possível autenticar a conta para o chat")
+
+    def _image_request(self, endpoint: str, payload: dict[str, Any]) -> bytes:
+        for attempt in range(2):
+            self.account.ensure_valid()
+            try:
+                response = requests.post(
+                    f"{self.base_url}/{endpoint}",
+                    headers=self.headers(),
+                    json=payload,
+                    timeout=(15, 360),
+                )
+            except requests.RequestException as exc:
+                raise UserVisibleError(f"falha ao processar imagem: {safe_exception(exc)}") from exc
+            if response.status_code == 401 and attempt == 0 and self.account.refresh(force=True):
+                response.close()
+                continue
+            if not response.ok:
+                raise response_error(response, "falha ao processar imagem")
+            try:
+                body = response.json()
+                encoded = body["data"][0]["b64_json"]
+                return base64.b64decode(encoded, validate=True)
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise UserVisibleError("o serviço retornou uma imagem em formato inesperado") from exc
+        raise UserVisibleError("não foi possível autenticar a conta para imagens")
+
+    @staticmethod
+    def save_image(
+        image_bytes: bytes,
+        output_file: Path,
+        target_width: int | None,
+        target_height: int | None,
+    ) -> Path:
+        output_file = output_file.resolve()
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        if target_width is None or target_height is None:
+            output_file.write_bytes(image_bytes)
+            return output_file
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as source:
+                source.load()
+                converted = source.convert("RGBA" if "A" in source.getbands() else "RGB")
+                resized = converted.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                resized.save(output_file, format="PNG")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise UserVisibleError("não foi possível redimensionar a imagem retornada") from exc
+        return output_file
+
+    def generate_image(
+        self,
+        prompt: str,
+        output_file: Path,
+        size: str,
+        quality: str,
+        background: str,
+        target_width: int | None = None,
+        target_height: int | None = None,
+    ) -> Path:
+        image_bytes = self._image_request(
+            "images/generations",
+            {
+                "model": IMAGE_MODEL,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "background": background,
+            },
+        )
+        return self.save_image(image_bytes, output_file, target_width, target_height)
+
+    def edit_image(
+        self,
+        prompt: str,
+        image_path: Path,
+        output_file: Path,
+        size: str,
+        quality: str,
+        background: str,
+        target_width: int | None = None,
+        target_height: int | None = None,
+    ) -> Path:
+        if not image_path.is_file():
+            raise UserVisibleError("a imagem de referência não foi encontrada")
+        if image_path.stat().st_size > 25 * 1024 * 1024:
+            raise UserVisibleError("a imagem de referência excede 25 MB")
+        image_bytes = image_path.read_bytes()
+        suffix = image_path.suffix.lower()
+        mime = "image/png" if suffix == ".png" else "image/jpeg"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        result = self._image_request(
+            "images/edits",
+            {
+                "model": IMAGE_MODEL,
+                "prompt": prompt,
+                "images": [{"image_url": f"data:{mime};base64,{encoded}"}],
+                "size": size,
+                "quality": quality,
+                "background": background,
+            },
+        )
+        return self.save_image(result, output_file, target_width, target_height)
+
+
+# ---------------------------------------------------------------------------
+# Device code e PKCE
+# ---------------------------------------------------------------------------
+
+
+def auth_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        "originator": OAUTH_ORIGINATOR,
+    }
+
+
+@dataclass(frozen=True)
+class DeviceAuthorization:
+    user_code: str
+    device_auth_id: str
+    verification_url: str
+    interval: int
+    expires_at: float
+
+
+def request_device_code() -> DeviceAuthorization:
+    try:
+        response = requests.post(
+            DEVICE_USERCODE_URL,
+            json={"client_id": OAUTH_CLIENT_ID},
+            headers={**auth_headers(), "Content-Type": "application/json"},
+            timeout=(10, 30),
+        )
+    except requests.RequestException as exc:
+        raise UserVisibleError(f"falha ao solicitar device code: {safe_exception(exc)}") from exc
+
+    if response.status_code == 404:
+        raise UserVisibleError(
+            "device code não está habilitado para esta conta/workspace; "
+            "ative-o nas configurações de segurança do ChatGPT ou use PKCE/importação"
+        )
+    if not response.ok:
+        raise response_error(response, "falha ao solicitar device code")
+    try:
+        body = response.json()
+        user_code = str(body["user_code"]).strip()
+        device_auth_id = str(body["device_auth_id"]).strip()
+        interval = int(str(body.get("interval", "5")).strip())
+    except (ValueError, KeyError, TypeError) as exc:
+        raise UserVisibleError("o serviço retornou um device code inválido") from exc
+    if not user_code or not device_auth_id:
+        raise UserVisibleError("o serviço não retornou os dados completos do device code")
+    return DeviceAuthorization(
+        user_code=user_code,
+        device_auth_id=device_auth_id,
+        verification_url=DEVICE_VERIFICATION_URL,
+        interval=max(1, min(30, interval)),
+        expires_at=time.time() + 15 * 60,
+    )
+
+
+def exchange_authorization_code(code: str, verifier: str, redirect_uri: str) -> TokenBundle:
+    if not code or not verifier:
+        raise UserVisibleError("código ou verificador PKCE ausente")
+    try:
+        response = requests.post(
+            OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": OAUTH_CLIENT_ID,
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+            headers={**auth_headers(), "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=(10, 30),
+        )
+    except requests.RequestException as exc:
+        raise UserVisibleError(f"falha ao trocar o código por tokens: {safe_exception(exc)}") from exc
+    if not response.ok:
+        raise response_error(response, "falha ao trocar o código por tokens")
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise UserVisibleError("o login retornou uma resposta inválida") from exc
+    bundle = bundle_from_mapping(body)
+    if not bundle:
+        raise UserVisibleError("o login não retornou access_token")
+    return bundle
+
+
+def poll_device_code(device: DeviceAuthorization, cancel_event: threading.Event) -> TokenBundle:
+    while time.time() < device.expires_at:
+        if cancel_event.is_set():
+            raise LoginCancelled("login cancelado")
+        try:
+            response = requests.post(
+                DEVICE_TOKEN_URL,
+                json={
+                    "device_auth_id": device.device_auth_id,
+                    "user_code": device.user_code,
+                },
+                headers={**auth_headers(), "Content-Type": "application/json"},
+                timeout=(10, 30),
+            )
+        except requests.RequestException as exc:
+            if cancel_event.wait(device.interval):
+                raise LoginCancelled("login cancelado") from exc
+            continue
+
+        if response.ok:
+            try:
+                body = response.json()
+                authorization_code = str(body["authorization_code"]).strip()
+                verifier = str(body["code_verifier"]).strip()
+            except (ValueError, KeyError, TypeError) as exc:
+                raise UserVisibleError("a aprovação do device code retornou dados incompletos") from exc
+            return exchange_authorization_code(
+                authorization_code,
+                verifier,
+                DEVICE_REDIRECT_URI,
+            )
+
+        # O endpoint oficial usa 403/404 enquanto a aprovação ainda está pendente.
+        if response.status_code not in {403, 404}:
+            raise response_error(response, "device code recusado")
+        if cancel_event.wait(device.interval):
+            raise LoginCancelled("login cancelado")
+
+    raise UserVisibleError("o device code expirou após 15 minutos; inicie outro login")
+
+
+def generate_pkce() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode("ascii").rstrip("=")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return verifier, challenge
+
+
+def build_browser_login_url(challenge: str, state: str) -> str:
+    params = {
+        "response_type": "code",
+        "client_id": OAUTH_CLIENT_ID,
+        "redirect_uri": BROWSER_REDIRECT_URI,
+        "scope": BROWSER_SCOPE,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "originator": OAUTH_ORIGINATOR,
+    }
+    return f"{BROWSER_AUTH_URL}?{urlencode(params)}"
+
+
+def parse_browser_callback(url: str, expected_state: str) -> str:
+    try:
+        parsed = urlsplit(url.strip())
+    except ValueError as exc:
+        raise UserVisibleError("URL de callback inválida") from exc
+    if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise UserVisibleError("o callback precisa ser a URL localhost fornecida pelo login")
+    if parsed.path != "/auth/callback":
+        raise UserVisibleError("a URL não aponta para /auth/callback")
+    query = parse_qs(parsed.query)
+    if query.get("error"):
+        detail = query.get("error_description", query["error"])[0]
+        raise UserVisibleError(f"login recusado: {redact_secrets(detail)}")
+    state = query.get("state", [""])[0]
+    if not state or not secrets.compare_digest(state, expected_state):
+        raise UserVisibleError("state do callback não confere; reinicie o login PKCE")
+    code = query.get("code", [""])[0].strip()
+    if not code:
+        raise UserVisibleError("a URL de callback não contém code")
+    return code
+
+
+# ---------------------------------------------------------------------------
+# Sessões e helpers do Telegram
+# ---------------------------------------------------------------------------
+
+
+SUPPORTED_API_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+
+
+def closest_api_size(width: int, height: int) -> str:
+    if width == height:
+        return "1024x1024"
+    return "1536x1024" if width > height else "1024x1536"
+
+
+@dataclass
+class UserSession:
+    account_identity: str | None = None
+    account: CodexAccount | None = None
+    client: CodexClient | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
+    preferred_model: str = DEFAULT_MODEL
+    state: str | None = None
+    pending_prompt: str = ""
+    pending_count: int = 1
+    pending_reference_path: Path | None = None
+    pending_size: str = "1536x1024"
+    pending_quality: str = "auto"
+    pending_background: str = "auto"
+    pending_target_width: int | None = None
+    pending_target_height: int | None = None
+    pkce_verifier: str | None = None
+    pkce_state: str | None = None
+    pkce_expires_at: float | None = None
+    device_nonce: str | None = None
+    device_cancel_event: threading.Event | None = None
+    device_task: asyncio.Task[Any] | None = None
+    busy_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def select_account(self, account: CodexAccount) -> None:
+        self.account = account
+        self.account_identity = account.identity
+        self.client = CodexClient(account)
+
+    def reset_image_flow(self) -> None:
+        self.state = None
+        self.pending_prompt = ""
+        self.pending_count = 1
+        self.pending_reference_path = None
+        self.pending_size = "1536x1024"
+        self.pending_quality = "auto"
+        self.pending_background = "auto"
+        self.pending_target_width = None
+        self.pending_target_height = None
+
+
+sessions: dict[int, UserSession] = {}
+
+
+def get_session(user_id: int) -> UserSession:
+    return sessions.setdefault(user_id, UserSession())
+
+
+def load_accounts() -> list[CodexAccount]:
+    return AuthManager().load_accounts()
+
+
+def ensure_client(session: UserSession) -> bool:
+    if session.client and session.account:
+        return True
+    accounts = load_accounts()
+    if not accounts:
+        return False
+    selected = next(
+        (account for account in accounts if account.identity == session.account_identity),
+        accounts[0],
+    )
+    session.select_account(selected)
+    return True
+
+
+def select_saved_identity(session: UserSession, identity: str) -> None:
+    account = next((item for item in load_accounts() if item.identity == identity), None)
+    if account:
+        session.select_account(account)
+
+
+async def check_access(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if ALLOWED_TELEGRAM_USER_IDS and user.id not in ALLOWED_TELEGRAM_USER_IDS:
+        if update.effective_message:
+            await update.effective_message.reply_text("Este bot é privado e seu usuário não está autorizado.")
+        return False
+    return True
+
+
+def split_text(text: str, limit: int = 4000) -> list[str]:
+    text = text or ""
+    chunks: list[str] = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+    if text or not chunks:
+        chunks.append(text)
+    return chunks
+
+
+async def send_text(
+    update: Update,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    message = update.effective_message
+    if not message:
+        return
+    chunks = split_text(text)
+    for index, chunk in enumerate(chunks):
+        await message.reply_text(
+            chunk,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            disable_web_page_preview=True,
+        )
+
+
+async def send_bot_text(bot: Any, chat_id: int, text: str) -> None:
+    for chunk in split_text(text):
+        await bot.send_message(chat_id=chat_id, text=chunk, disable_web_page_preview=True)
+
+
+async def send_photo_path(update: Update, path: Path, caption: str = "") -> None:
+    message = update.effective_message
+    if not message:
+        return
+    try:
+        with path.open("rb") as stream:
+            await message.reply_photo(photo=stream, caption=caption[:1024])
+    except TelegramError:
+        with path.open("rb") as stream:
+            await message.reply_document(document=stream, caption=caption[:1024])
+
+
+# ---------------------------------------------------------------------------
+# Comandos básicos e gerenciamento de contas
+# ---------------------------------------------------------------------------
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    session = get_session(update.effective_user.id)
+    ensure_client(session)
+    account_text = "Nenhuma conta disponível. Use /login."
+    if session.account:
+        account_text = (
+            f"Conta atual: {session.account.label}\n"
+            f"E-mail: {session.account.email}\n"
+            f"Plano: {plan_label(session.account.plan_type)}"
+        )
+    text = (
+        "Codex Telegram Unificado\n\n"
+        "Comandos:\n"
+        "/login - entrar ou importar auth.json\n"
+        "/importar - aguardar um arquivo JSON\n"
+        "/callback <url> - concluir login PKCE\n"
+        "/cancelar - cancelar o fluxo atual\n"
+        "/contas - listar contas\n"
+        "/usar <número> - escolher uma conta\n"
+        "/status - consultar quota\n"
+        "/limpar - apagar o histórico do chat\n"
+        "/imagem <descrição> - gerar uma imagem\n"
+        f"/imagem <n> <descrição> - gerar até {MAX_IMAGES} imagens\n\n"
+        "Envie texto para conversar. Envie uma foto para iniciar uma edição.\n\n"
+        f"{account_text}"
+    )
+    await send_text(update, text)
+
+
+async def cmd_contas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    session = get_session(update.effective_user.id)
+    accounts = load_accounts()
+    if not accounts:
+        await send_text(update, "Nenhuma conta encontrada em DATA_DIR. Use /login ou /importar.")
+        return
+    lines = ["Contas disponíveis:"]
+    for index, account in enumerate(accounts, start=1):
+        marker = "→" if account.identity == session.account_identity else " "
+        lines.extend(
+            [
+                f"{marker} {index}. {account.label}",
+                f"   {account.email} | {plan_label(account.plan_type)}",
+                f"   expira: {format_expiration(account.access_token)} | arquivo: {account.auth_file.name}",
+            ]
+        )
+    await send_text(update, "\n".join(lines))
+
+
+async def cmd_usar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if not context.args:
+        await send_text(update, "Uso: /usar <número>. Consulte os números com /contas.")
+        return
+    try:
+        index = int(context.args[0])
+    except ValueError:
+        await send_text(update, "O número da conta é inválido.")
+        return
+    accounts = load_accounts()
+    if index < 1 or index > len(accounts):
+        await send_text(update, f"Escolha uma conta entre 1 e {len(accounts)}.")
+        return
+    session = get_session(update.effective_user.id)
+    session.select_account(accounts[index - 1])
+    session.history.clear()
+    await send_text(
+        update,
+        f"Conta selecionada: {session.account.label}\n"
+        f"{session.account.email} | {plan_label(session.account.plan_type)}",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    session = get_session(update.effective_user.id)
+    if not ensure_client(session):
+        await send_text(update, "Nenhuma conta disponível. Use /login.")
+        return
+    await send_text(update, "Consultando quota...")
+    quota = await asyncio.to_thread(session.account.check_quota)
+    five = quota.get("five_hour_pct")
+    weekly = quota.get("weekly_pct")
+    five_text = f"{five:.0f}% disponível" if isinstance(five, (int, float)) else "não informado"
+    weekly_text = f"{weekly:.0f}% disponível" if isinstance(weekly, (int, float)) else "não informado"
+    lines = [
+        f"Conta: {session.account.label}",
+        f"E-mail: {session.account.email}",
+        f"Plano: {plan_label(session.account.plan_type)}",
+        f"Janela curta: {five_text}",
+        f"Reinicia em: {format_remaining(quota.get('five_hour_reset'))}",
+        f"Janela semanal: {weekly_text}",
+        f"Reinicia em: {format_remaining(quota.get('weekly_reset'))}",
+    ]
+    if quota.get("error"):
+        lines.append(f"Erro: {quota['error']}")
+    await send_text(update, "\n".join(lines))
+
+
+async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    get_session(update.effective_user.id).history.clear()
+    await send_text(update, "Histórico de chat apagado.")
+
+
+# ---------------------------------------------------------------------------
+# Login: device code, PKCE e importação JSON
+# ---------------------------------------------------------------------------
+
+
+def login_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Device Code", callback_data="login:device")],
+            [InlineKeyboardButton("Navegador (PKCE)", callback_data="login:pkce")],
+            [InlineKeyboardButton("Importar arquivo .json", callback_data="login:import")],
+            [InlineKeyboardButton("Cancelar fluxo", callback_data="flow:cancel")],
+        ]
+    )
+
+
+async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await send_text(
+        update,
+        "Escolha como adicionar a conta. Nunca envie seu auth.json para outra pessoa ou outro bot.",
+        reply_markup=login_keyboard(),
+    )
+
+
+async def start_import_login(update: Update, session: UserSession) -> None:
+    session.state = "awaiting_auth_json"
+    await send_text(
+        update,
+        "Importar conta\n\n"
+        "Envie agora um documento com extensão .json. São aceitos auth.json do Codex CLI, "
+        "credential_pool e objetos com access_token. O arquivo será validado e salvo em DATA_DIR "
+        "com nome authN.json.\n\n"
+        "Atenção: o documento contém credenciais equivalentes a uma senha.",
+    )
+
+
+async def cmd_importar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await start_import_login(update, get_session(update.effective_user.id))
+
+
+async def complete_device_login(
+    application: Application,
+    user_id: int,
+    chat_id: int,
+    nonce: str,
+    device: DeviceAuthorization,
+    cancel_event: threading.Event,
+) -> None:
+    try:
+        bundle = await asyncio.to_thread(poll_device_code, device, cancel_event)
+        result = await asyncio.to_thread(save_token_bundle, bundle)
+        session = get_session(user_id)
+        if session.device_nonce != nonce:
+            return
+        select_saved_identity(session, result.identity)
+        session.state = None
+        await send_bot_text(
+            application.bot,
+            chat_id,
+            f"Login concluído. Conta {result.label} {result.action} em {result.path.name}.",
+        )
+    except LoginCancelled:
+        await send_bot_text(application.bot, chat_id, "Login por device code cancelado.")
+    except Exception as exc:
+        logger.warning("Device code falhou para user_id=%s: %s", user_id, safe_exception(exc))
+        await send_bot_text(
+            application.bot,
+            chat_id,
+            f"Erro no device code: {safe_exception(exc)}",
+        )
+    finally:
+        session = get_session(user_id)
+        if session.device_nonce == nonce:
+            session.device_nonce = None
+            session.device_cancel_event = None
+            session.device_task = None
+            if session.state == "awaiting_device_approval":
+                session.state = None
+
+
+async def start_device_login(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+) -> None:
+    if session.device_task and not session.device_task.done():
+        await send_text(update, "Já existe um login por device code aguardando. Use /cancelar primeiro.")
+        return
+    await send_text(update, "Solicitando um código de dispositivo...")
+    try:
+        device = await asyncio.to_thread(request_device_code)
+    except Exception as exc:
+        await send_text(update, f"Não foi possível iniciar o device code: {safe_exception(exc)}")
+        return
+
+    nonce = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    session.state = "awaiting_device_approval"
+    session.device_nonce = nonce
+    session.device_cancel_event = cancel_event
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Abrir página de autorização", url=device.verification_url)],
+            [InlineKeyboardButton("Cancelar", callback_data="flow:cancel")],
+        ]
+    )
+    await send_text(
+        update,
+        "Login por Device Code\n\n"
+        f"1. Abra {device.verification_url}\n"
+        f"2. Digite este código: {device.user_code}\n"
+        "3. Confirme que foi você quem iniciou este login.\n\n"
+        "O código expira em 15 minutos. Se a conta ou o workspace bloquear device code, "
+        "ative essa opção nas configurações de segurança ou use PKCE/importação.",
+        reply_markup=keyboard,
+    )
+    task = context.application.create_task(
+        complete_device_login(
+            context.application,
+            update.effective_user.id,
+            update.effective_chat.id,
+            nonce,
+            device,
+            cancel_event,
+        ),
+        update=update,
+        name=f"device-login-{update.effective_user.id}",
+    )
+    session.device_task = task
+
+
+async def start_pkce_login(update: Update, session: UserSession) -> None:
+    verifier, challenge = generate_pkce()
+    state = secrets.token_urlsafe(24)
+    auth_url = build_browser_login_url(challenge, state)
+    session.state = "awaiting_browser_callback"
+    session.pkce_verifier = verifier
+    session.pkce_state = state
+    session.pkce_expires_at = time.time() + 10 * 60
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Abrir login da OpenAI", url=auth_url)],
+            [InlineKeyboardButton("Cancelar", callback_data="flow:cancel")],
+        ]
+    )
+    await send_text(
+        update,
+        "Login PKCE\n\n"
+        "1. Abra o botão abaixo e conclua o login.\n"
+        "2. O navegador tentará abrir localhost e poderá mostrar erro de conexão; isso é esperado.\n"
+        "3. Copie a URL completa da barra de endereço.\n"
+        "4. Envie a URL aqui diretamente ou com /callback <url>.\n\n"
+        "O callback expira em 10 minutos e o parâmetro state será validado.",
+        reply_markup=keyboard,
+    )
+
+
+async def process_browser_callback(update: Update, session: UserSession, url: str) -> None:
+    if session.state != "awaiting_browser_callback":
+        await send_text(update, "Não existe login PKCE pendente. Use /login primeiro.")
+        return
+    if not session.pkce_verifier or not session.pkce_state:
+        await send_text(update, "Os dados do PKCE foram perdidos. Reinicie o login.")
+        return
+    if not session.pkce_expires_at or time.time() > session.pkce_expires_at:
+        session.state = None
+        session.pkce_verifier = None
+        session.pkce_state = None
+        await send_text(update, "O login PKCE expirou. Inicie outro com /login.")
+        return
+    try:
+        code = parse_browser_callback(url, session.pkce_state)
+    except UserVisibleError as exc:
+        await send_text(update, f"Callback inválido: {safe_exception(exc)}")
+        return
+
+    await send_text(update, "Trocando o código PKCE por tokens...")
+    try:
+        bundle = await asyncio.to_thread(
+            exchange_authorization_code,
+            code,
+            session.pkce_verifier,
+            BROWSER_REDIRECT_URI,
+        )
+        result = await asyncio.to_thread(save_token_bundle, bundle)
+    except Exception as exc:
+        await send_text(update, f"Erro ao concluir PKCE: {safe_exception(exc)}")
+        return
+
+    session.state = None
+    session.pkce_verifier = None
+    session.pkce_state = None
+    session.pkce_expires_at = None
+    select_saved_identity(session, result.identity)
+    await send_text(
         update,
         f"Login concluído. Conta {result.label} {result.action} em {result.path.name}.",
     )
@@ -1071,6 +2162,3 @@ def main() -> None:
         drop_pending_updates=True,
     )
 
-
-if __name__ == "__main__":
-    main()
