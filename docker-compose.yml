@@ -1,0 +1,29 @@
+services:
+  codex-telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-telegram-unificado:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN precisa ser definida}
+      DATA_DIR: /app/data
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-gpt-5.4-mini}
+      IMAGE_MODEL: ${IMAGE_MODEL:-gpt-image-2}
+      MAX_IMAGES: ${MAX_IMAGES:-5}
+      ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - codex-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  codex-data:
