@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import requests
 from PIL import Image, UnidentifiedImageError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -1360,36 +1360,116 @@ async def send_photo_path(update: Update, path: Path, caption: str = "") -> None
 # ---------------------------------------------------------------------------
 
 
+def main_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🖼️ Gerar imagem", callback_data="panel:generate"),
+                InlineKeyboardButton("✏️ Editar foto", callback_data="panel:edit"),
+            ],
+            [
+                InlineKeyboardButton("💬 Conversar", callback_data="panel:chat"),
+                InlineKeyboardButton("📊 Ver quota", callback_data="panel:status"),
+            ],
+            [
+                InlineKeyboardButton("👤 Minhas contas", callback_data="panel:accounts"),
+                InlineKeyboardButton("🔐 Adicionar conta", callback_data="panel:login"),
+            ],
+            [
+                InlineKeyboardButton("📥 Importar JSON", callback_data="panel:import"),
+                InlineKeyboardButton("🧹 Limpar chat", callback_data="panel:clear"),
+            ],
+            [
+                InlineKeyboardButton("❌ Cancelar fluxo", callback_data="flow:cancel"),
+                InlineKeyboardButton("ℹ️ Ajuda", callback_data="panel:help"),
+            ],
+            [InlineKeyboardButton("🔄 Atualizar painel", callback_data="panel:home")],
+        ]
+    )
+
+
+def panel_navigation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬅️ Painel", callback_data="panel:home"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="flow:cancel"),
+            ]
+        ]
+    )
+
+
+def account_selection_keyboard(accounts: list[CodexAccount]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, account in enumerate(accounts, start=1):
+        label = account.label if len(account.label) <= 28 else f"{account.label[:25]}..."
+        rows.append(
+            [InlineKeyboardButton(f"{index}. {label}", callback_data=f"account:select:{index}")]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Painel principal", callback_data="panel:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_main_panel(
+    update: Update,
+    session: UserSession,
+    notice: str = "",
+) -> None:
+    accounts = load_accounts()
+    ensure_client(session)
+    if session.account:
+        account_text = (
+            f"{session.account.label}\n"
+            f"{session.account.email} • {plan_label(session.account.plan_type)}"
+        )
+    else:
+        account_text = "Nenhuma conta conectada"
+    prefix = f"{notice}\n\n" if notice else ""
+    await send_text(
+        update,
+        f"{prefix}🎛️ PAINEL PRINCIPAL\n\n"
+        f"👤 Conta atual:\n{account_text}\n\n"
+        f"📁 Contas salvas: {len(accounts)}\n"
+        "Escolha uma ação nos botões abaixo:",
+        reply_markup=main_panel_keyboard(),
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    session = get_session(update.effective_user.id)
-    ensure_client(session)
-    account_text = "Nenhuma conta disponível. Use /login."
-    if session.account:
-        account_text = (
-            f"Conta atual: {session.account.label}\n"
-            f"E-mail: {session.account.email}\n"
-            f"Plano: {plan_label(session.account.plan_type)}"
-        )
-    text = (
-        "Codex Telegram Unificado\n\n"
-        "Comandos:\n"
-        "/login - entrar ou importar auth.json\n"
-        "/importar - aguardar um arquivo JSON\n"
-        "/callback <url> - concluir login PKCE\n"
-        "/cancelar - cancelar o fluxo atual\n"
-        "/contas - listar contas\n"
-        "/usar <número> - escolher uma conta\n"
-        "/status - consultar quota\n"
-        "/limpar - apagar o histórico do chat\n"
-        "/imagem <descrição> - gerar uma imagem\n"
-        f"/imagem <n> <descrição> - gerar até {MAX_IMAGES} imagens\n"
-        "/imagem auto <descrição> - gerar horizontal com opções automáticas\n\n"
-        "Envie texto para conversar. Envie uma foto para iniciar uma edição.\n\n"
-        f"{account_text}"
+    await show_main_panel(
+        update,
+        get_session(update.effective_user.id),
+        notice="👋 Bem-vindo ao Codex Telegram.",
     )
-    await send_text(update, text)
+
+
+async def cmd_painel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await show_main_panel(update, get_session(update.effective_user.id))
+
+
+async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await send_text(
+        update,
+        "ℹ️ AJUDA RÁPIDA\n\n"
+        "Use os botões do /painel ou continue usando comandos:\n\n"
+        "/imagem <prompt> — abre as opções de imagem\n"
+        "/imagem auto <prompt> — gera horizontal automaticamente\n"
+        f"/imagem auto <n> <prompt> — gera até {MAX_IMAGES}\n"
+        "/contas e /usar <n> — gerenciar contas\n"
+        "/status — consultar quota\n"
+        "/login ou /importar — adicionar conta\n"
+        "/limpar — limpar histórico\n"
+        "/cancelar — cancelar o fluxo atual\n\n"
+        "💬 Para conversar, basta enviar uma mensagem.\n"
+        "✏️ Para editar, envie uma foto e depois descreva a alteração.",
+        reply_markup=panel_navigation_keyboard(),
+    )
 
 
 async def cmd_contas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1398,7 +1478,18 @@ async def cmd_contas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session = get_session(update.effective_user.id)
     accounts = load_accounts()
     if not accounts:
-        await send_text(update, "Nenhuma conta encontrada em DATA_DIR. Use /login ou /importar.")
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔐 Adicionar conta", callback_data="panel:login")],
+                [InlineKeyboardButton("📥 Importar JSON", callback_data="panel:import")],
+                [InlineKeyboardButton("⬅️ Painel", callback_data="panel:home")],
+            ]
+        )
+        await send_text(
+            update,
+            "Nenhuma conta encontrada em DATA_DIR. Escolha como adicionar:",
+            reply_markup=keyboard,
+        )
         return
     lines = ["Contas disponíveis:"]
     for index, account in enumerate(accounts, start=1):
@@ -1410,7 +1501,7 @@ async def cmd_contas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"   expira: {format_expiration(account.access_token)} | arquivo: {account.auth_file.name}",
             ]
         )
-    await send_text(update, "\n".join(lines))
+    await send_text(update, "\n".join(lines), reply_markup=account_selection_keyboard(accounts))
 
 
 async def cmd_usar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1462,14 +1553,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     if quota.get("error"):
         lines.append(f"Erro: {quota['error']}")
-    await send_text(update, "\n".join(lines))
+    await send_text(update, "\n".join(lines), reply_markup=panel_navigation_keyboard())
 
 
 async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
     get_session(update.effective_user.id).history.clear()
-    await send_text(update, "Histórico de chat apagado.")
+    await send_text(
+        update,
+        "🧹 Histórico de chat apagado.",
+        reply_markup=panel_navigation_keyboard(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1483,7 +1578,10 @@ def login_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Device Code", callback_data="login:device")],
             [InlineKeyboardButton("Navegador (PKCE)", callback_data="login:pkce")],
             [InlineKeyboardButton("Importar arquivo .json", callback_data="login:import")],
-            [InlineKeyboardButton("Cancelar fluxo", callback_data="flow:cancel")],
+            [
+                InlineKeyboardButton("⬅️ Painel", callback_data="panel:home"),
+                InlineKeyboardButton("Cancelar fluxo", callback_data="flow:cancel"),
+            ],
         ]
     )
 
@@ -1507,6 +1605,7 @@ async def start_import_login(update: Update, session: UserSession) -> None:
         "credential_pool e objetos com access_token. O arquivo será validado e salvo em DATA_DIR "
         "com nome authN.json.\n\n"
         "Atenção: o documento contém credenciais equivalentes a uma senha.",
+        reply_markup=panel_navigation_keyboard(),
     )
 
 
@@ -1698,7 +1797,11 @@ async def cancel_flow(update: Update, session: UserSession) -> None:
     session.pkce_state = None
     session.pkce_expires_at = None
     session.reset_image_flow()
-    await send_text(update, "Fluxo atual cancelado.")
+    await send_text(
+        update,
+        "❌ Fluxo atual cancelado.",
+        reply_markup=panel_navigation_keyboard(),
+    )
 
 
 async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1745,7 +1848,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     for result in results:
         lines.append(f"• {result.label}: {result.action} em {result.path.name}")
     lines.append("Use /contas para conferir e /usar <número> para trocar.")
-    await send_text(update, "\n".join(lines))
+    await send_text(update, "\n".join(lines), reply_markup=main_panel_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1873,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if session.state == "awaiting_device_approval":
         await send_text(update, "Ainda aguardo a aprovação do device code. Use /cancelar para desistir.")
+        return
+    if session.state == "awaiting_image_prompt":
+        if not ensure_client(session):
+            await send_text(update, "Nenhuma conta disponível. Use /login primeiro.")
+            return
+        if len(text) > MAX_CHAT_CHARS:
+            await send_text(update, "O prompt da imagem é grande demais.")
+            return
+        session.pending_prompt = text
+        session.pending_count = 1
+        session.pending_reference_path = None
+        session.state = None
+        reset_image_options(session)
+        await ask_image_size(update, session)
+        return
+    if session.state == "awaiting_photo":
+        await send_text(
+            update,
+            "Estou aguardando uma foto. Use o clipe/câmera do Telegram para enviá-la.",
+            reply_markup=panel_navigation_keyboard(),
+        )
         return
     if session.state == "awaiting_custom_size":
         await handle_custom_size(update, context)
@@ -1825,11 +1949,20 @@ def reset_image_options(session: UserSession) -> None:
 async def ask_image_size(update: Update, session: UserSession) -> None:
     keyboard = InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "⚡ Automático horizontal",
+                    callback_data="image:auto",
+                )
+            ],
             [InlineKeyboardButton("Quadrado 1024x1024", callback_data="size:1024x1024")],
             [InlineKeyboardButton("Horizontal 1536x1024", callback_data="size:1536x1024")],
             [InlineKeyboardButton("Vertical 1024x1536", callback_data="size:1024x1536")],
             [InlineKeyboardButton("Tamanho personalizado", callback_data="size:custom")],
-            [InlineKeyboardButton("Cancelar", callback_data="flow:cancel")],
+            [
+                InlineKeyboardButton("⬅️ Painel", callback_data="panel:home"),
+                InlineKeyboardButton("Cancelar", callback_data="flow:cancel"),
+            ],
         ]
     )
     await send_text(
@@ -1847,7 +1980,10 @@ async def ask_image_quality(update: Update) -> None:
             [InlineKeyboardButton("Alta", callback_data="quality:high")],
             [InlineKeyboardButton("Média", callback_data="quality:medium")],
             [InlineKeyboardButton("Baixa", callback_data="quality:low")],
-            [InlineKeyboardButton("Cancelar", callback_data="flow:cancel")],
+            [
+                InlineKeyboardButton("⬅️ Painel", callback_data="panel:home"),
+                InlineKeyboardButton("Cancelar", callback_data="flow:cancel"),
+            ],
         ]
     )
     await send_text(update, "Escolha a qualidade:", reply_markup=keyboard)
@@ -1860,7 +1996,10 @@ async def ask_image_background(update: Update) -> None:
             [InlineKeyboardButton("Transparente", callback_data="background:transparent")],
             [InlineKeyboardButton("Branco", callback_data="background:white")],
             [InlineKeyboardButton("Preto", callback_data="background:black")],
-            [InlineKeyboardButton("Cancelar", callback_data="flow:cancel")],
+            [
+                InlineKeyboardButton("⬅️ Painel", callback_data="panel:home"),
+                InlineKeyboardButton("Cancelar", callback_data="flow:cancel"),
+            ],
         ]
     )
     await send_text(update, "Escolha o fundo:", reply_markup=keyboard)
@@ -1876,6 +2015,32 @@ def parse_image_command(rest: str) -> tuple[bool, int, str]:
     if parts and parts[0].isdigit():
         count = int(parts.pop(0))
     return automatic, count, " ".join(parts).strip()
+
+
+async def schedule_automatic_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    task_name: str,
+) -> bool:
+    if not session.pending_prompt:
+        await send_text(update, "O pedido de imagem expirou. Inicie novamente pelo painel.")
+        return False
+    if session.state == "image_generating" or session.busy_lock.locked():
+        await send_text(update, "Já existe uma operação em andamento para sua sessão.")
+        return False
+    reset_image_options(session)
+    session.state = "image_generating"
+    await send_text(
+        update,
+        "⚡ Modo automático: horizontal 1536x1024, qualidade automática e fundo automático.",
+    )
+    context.application.create_task(
+        generate_images(update, session, update.effective_user.id),
+        update=update,
+        name=task_name,
+    )
+    return True
 
 
 async def cmd_imagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1904,18 +2069,11 @@ async def cmd_imagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session.pending_reference_path = None
     reset_image_options(session)
     if automatic:
-        if session.state == "image_generating" or session.busy_lock.locked():
-            await send_text(update, "Já existe uma operação em andamento para sua sessão.")
-            return
-        session.state = "image_generating"
-        await send_text(
+        await schedule_automatic_image(
             update,
-            "Modo automático: horizontal 1536x1024, qualidade automática e fundo automático.",
-        )
-        context.application.create_task(
-            generate_images(update, session, update.effective_user.id),
-            update=update,
-            name=f"automatic-image-generation-{update.effective_user.id}",
+            context,
+            session,
+            task_name=f"automatic-image-generation-{update.effective_user.id}",
         )
         return
     await ask_image_size(update, session)
@@ -1948,7 +2106,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     session.pending_prompt = ""
     reset_image_options(session)
     session.state = "awaiting_edit_prompt"
-    await send_text(update, "Foto recebida. Descreva agora como deseja editá-la.")
+    await send_text(
+        update,
+        "✅ Foto recebida. Descreva agora como deseja editá-la.",
+        reply_markup=panel_navigation_keyboard(),
+    )
 
 
 async def process_edit_prompt(update: Update, session: UserSession, text: str) -> None:
@@ -2056,14 +2218,86 @@ async def generate_images(update: Update, session: UserSession, user_id: int) ->
             await send_photo_path(update, result, caption=f"{index}/{count}: {prompt}")
         session.reset_image_flow()
         if errors:
-            await send_text(update, "\n".join(errors))
+            await send_text(update, "\n".join(errors), reply_markup=panel_navigation_keyboard())
         if successes:
-            await send_text(update, f"Concluído: {successes}/{count} imagem(ns) enviada(s).")
+            await send_text(
+                update,
+                f"✅ Concluído: {successes}/{count} imagem(ns) enviada(s).",
+                reply_markup=panel_navigation_keyboard(),
+            )
 
 
 # ---------------------------------------------------------------------------
 # Callbacks, erros e inicialização
 # ---------------------------------------------------------------------------
+
+
+VISUAL_IMAGE_STATES = {
+    "awaiting_image_prompt",
+    "awaiting_photo",
+    "awaiting_edit_prompt",
+    "awaiting_custom_size",
+}
+
+AUTH_FLOW_STATES = {
+    "awaiting_auth_json",
+    "awaiting_browser_callback",
+    "awaiting_device_approval",
+}
+
+
+def clear_visual_image_flow(session: UserSession) -> None:
+    if session.state in VISUAL_IMAGE_STATES:
+        session.reset_image_flow()
+
+
+async def start_visual_image_flow(update: Update, session: UserSession) -> None:
+    if session.state in AUTH_FLOW_STATES:
+        await send_text(
+            update,
+            "Há um login/importação pendente. Use Cancelar fluxo antes de gerar uma imagem.",
+            reply_markup=panel_navigation_keyboard(),
+        )
+        return
+    if not ensure_client(session):
+        await send_text(
+            update,
+            "Você precisa adicionar uma conta antes de gerar imagens.",
+            reply_markup=login_keyboard(),
+        )
+        return
+    session.reset_image_flow()
+    session.state = "awaiting_image_prompt"
+    await send_text(
+        update,
+        "🖼️ GERAR IMAGEM\n\nEnvie agora a descrição da imagem que deseja criar.",
+        reply_markup=panel_navigation_keyboard(),
+    )
+
+
+async def start_visual_edit_flow(update: Update, session: UserSession) -> None:
+    if session.state in AUTH_FLOW_STATES:
+        await send_text(
+            update,
+            "Há um login/importação pendente. Use Cancelar fluxo antes de editar uma foto.",
+            reply_markup=panel_navigation_keyboard(),
+        )
+        return
+    if not ensure_client(session):
+        await send_text(
+            update,
+            "Você precisa adicionar uma conta antes de editar fotos.",
+            reply_markup=login_keyboard(),
+        )
+        return
+    session.reset_image_flow()
+    session.state = "awaiting_photo"
+    await send_text(
+        update,
+        "✏️ EDITAR FOTO\n\nEnvie agora a foto pelo clipe ou pela câmera do Telegram. "
+        "Depois eu pedirei o prompt da edição.",
+        reply_markup=panel_navigation_keyboard(),
+    )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2074,6 +2308,79 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     session = get_session(update.effective_user.id)
     data = query.data or ""
 
+    if data == "panel:home":
+        clear_visual_image_flow(session)
+        await show_main_panel(update, session)
+        return
+    if data == "panel:generate":
+        await start_visual_image_flow(update, session)
+        return
+    if data == "panel:edit":
+        await start_visual_edit_flow(update, session)
+        return
+    if data == "panel:chat":
+        if session.state in AUTH_FLOW_STATES:
+            await send_text(
+                update,
+                "Há um login/importação pendente. Conclua ou cancele esse fluxo primeiro.",
+                reply_markup=panel_navigation_keyboard(),
+            )
+            return
+        if not ensure_client(session):
+            await send_text(update, "Adicione uma conta para conversar.", reply_markup=login_keyboard())
+            return
+        clear_visual_image_flow(session)
+        await send_text(
+            update,
+            "💬 CHAT\n\nEnvie sua pergunta ou mensagem. As próximas mensagens serão tratadas como chat.",
+            reply_markup=panel_navigation_keyboard(),
+        )
+        return
+    if data == "panel:status":
+        await cmd_status(update, context)
+        return
+    if data == "panel:accounts":
+        await cmd_contas(update, context)
+        return
+    if data == "panel:login":
+        await cmd_login(update, context)
+        return
+    if data == "panel:import":
+        await start_import_login(update, session)
+        return
+    if data == "panel:clear":
+        session.history.clear()
+        await show_main_panel(update, session, notice="🧹 Histórico de chat apagado.")
+        return
+    if data == "panel:help":
+        await cmd_ajuda(update, context)
+        return
+    if data.startswith("account:select:"):
+        try:
+            index = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            await send_text(update, "Seleção de conta inválida.")
+            return
+        accounts = load_accounts()
+        if index < 1 or index > len(accounts):
+            await send_text(update, "Essa lista de contas expirou. Abra Minhas contas novamente.")
+            return
+        session.select_account(accounts[index - 1])
+        session.history.clear()
+        await show_main_panel(
+            update,
+            session,
+            notice=f"✅ Conta selecionada: {session.account.label}",
+        )
+        return
+    if data == "image:auto":
+        await schedule_automatic_image(
+            update,
+            context,
+            session,
+            task_name=f"visual-auto-image-{update.effective_user.id}",
+        )
+        return
     if data == "flow:cancel":
         await cancel_flow(update, session)
         return
@@ -2152,9 +2459,29 @@ def require_telegram_token() -> str:
     return token
 
 
+async def configure_bot_commands(application: Application) -> None:
+    commands = [
+        BotCommand("painel", "Abrir o painel visual"),
+        BotCommand("imagem", "Gerar imagem"),
+        BotCommand("contas", "Listar e selecionar contas"),
+        BotCommand("status", "Consultar quota da conta"),
+        BotCommand("login", "Adicionar uma conta"),
+        BotCommand("importar", "Importar auth.json"),
+        BotCommand("limpar", "Limpar histórico do chat"),
+        BotCommand("cancelar", "Cancelar o fluxo atual"),
+        BotCommand("ajuda", "Ver ajuda e comandos"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except TelegramError as exc:
+        logger.warning("Não foi possível configurar o menu de comandos: %s", safe_exception(exc))
+
+
 def build_application(token: str) -> Application:
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(configure_bot_commands).build()
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("painel", cmd_painel))
+    application.add_handler(CommandHandler("ajuda", cmd_ajuda))
     application.add_handler(CommandHandler("login", cmd_login))
     application.add_handler(CommandHandler("importar", cmd_importar))
     application.add_handler(CommandHandler("callback", cmd_callback))
