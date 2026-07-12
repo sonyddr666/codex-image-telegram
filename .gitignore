@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+*.log
+auth*.json
+data/
+imagens/
+referencias/
