@@ -1384,7 +1384,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status - consultar quota\n"
         "/limpar - apagar o histórico do chat\n"
         "/imagem <descrição> - gerar uma imagem\n"
-        f"/imagem <n> <descrição> - gerar até {MAX_IMAGES} imagens\n\n"
+        f"/imagem <n> <descrição> - gerar até {MAX_IMAGES} imagens\n"
+        "/imagem auto <descrição> - gerar horizontal com opções automáticas\n\n"
         "Envie texto para conversar. Envie uma foto para iniciar uma edição.\n\n"
         f"{account_text}"
     )
@@ -1865,6 +1866,18 @@ async def ask_image_background(update: Update) -> None:
     await send_text(update, "Escolha o fundo:", reply_markup=keyboard)
 
 
+def parse_image_command(rest: str) -> tuple[bool, int, str]:
+    """Interpreta /imagem [auto] [quantidade] prompt."""
+    parts = rest.split()
+    automatic = bool(parts and parts[0].lower() == "auto")
+    if automatic:
+        parts.pop(0)
+    count = 1
+    if parts and parts[0].isdigit():
+        count = int(parts.pop(0))
+    return automatic, count, " ".join(parts).strip()
+
+
 async def cmd_imagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
@@ -1873,18 +1886,15 @@ async def cmd_imagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await send_text(update, "Nenhuma conta disponível. Use /login primeiro.")
         return
     rest = " ".join(context.args).strip()
-    count = 1
-    prompt = rest
-    if rest:
-        first, separator, remaining = rest.partition(" ")
-        if first.isdigit():
-            count = int(first)
-            prompt = remaining.strip() if separator else ""
+    automatic, count, prompt = parse_image_command(rest)
     if count < 1 or count > MAX_IMAGES:
         await send_text(update, f"A quantidade precisa ficar entre 1 e {MAX_IMAGES}.")
         return
     if not prompt:
-        await send_text(update, "Uso: /imagem <descrição> ou /imagem <n> <descrição>.")
+        await send_text(
+            update,
+            "Uso: /imagem <descrição>, /imagem <n> <descrição> ou /imagem auto <descrição>.",
+        )
         return
     if len(prompt) > MAX_CHAT_CHARS:
         await send_text(update, "O prompt da imagem é grande demais.")
@@ -1893,6 +1903,21 @@ async def cmd_imagem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session.pending_count = count
     session.pending_reference_path = None
     reset_image_options(session)
+    if automatic:
+        if session.state == "image_generating" or session.busy_lock.locked():
+            await send_text(update, "Já existe uma operação em andamento para sua sessão.")
+            return
+        session.state = "image_generating"
+        await send_text(
+            update,
+            "Modo automático: horizontal 1536x1024, qualidade automática e fundo automático.",
+        )
+        context.application.create_task(
+            generate_images(update, session, update.effective_user.id),
+            update=update,
+            name=f"automatic-image-generation-{update.effective_user.id}",
+        )
+        return
     await ask_image_size(update, session)
 
 
