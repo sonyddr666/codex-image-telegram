@@ -120,11 +120,39 @@ conta já existente é atualizada quando estiver em arquivo individual.
 `auth.json` contém credenciais equivalentes a uma senha. Não o envie para bots de terceiros,
 não o coloque no Git e não o exponha em logs.
 
+## Painel visual
+
+Envie `/start` ou `/painel` para abrir o painel principal. Ele mostra a conta atual e oferece
+botões para:
+
+- 🖼️ gerar imagem;
+- ✏️ editar uma foto;
+- 💬 iniciar chat;
+- 📊 consultar quota;
+- 👤 listar e selecionar contas;
+- 🔐 fazer login;
+- 📥 importar `auth.json`;
+- 🧹 limpar o histórico;
+- ❌ cancelar o fluxo atual;
+- ℹ️ abrir a ajuda.
+
+Ao escolher **Gerar imagem**, o bot pede o prompt e exibe presets visuais. O botão
+**Automático horizontal** gera imediatamente em `1536x1024`, com qualidade e fundo
+automáticos. Esse botão também aparece na edição de fotos.
+
+Ao escolher **Editar foto**, o bot pede a foto, depois o prompt da alteração e finalmente
+mostra os presets. O menu nativo de comandos do Telegram é configurado automaticamente na
+inicialização do bot.
+
+Todos os comandos de texto continuam funcionando normalmente.
+
 ## Comandos do Telegram
 
 | Comando | Função |
 |---|---|
 | `/start` | ajuda e conta selecionada |
+| `/painel` | abre o painel visual principal |
+| `/ajuda` | mostra ajuda e atalhos |
 | `/login` | device code, PKCE ou importação |
 | `/importar` | aguarda um documento JSON |
 | `/callback <url>` | conclui PKCE |
