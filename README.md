@@ -41,6 +41,37 @@ No Coolify, configure as variáveis abaixo com **Available at Runtime**. Deixe
 O token que apareceu nos logs anteriores deve ser revogado no BotFather. Use um token
 novo; retirar a opção de buildtime não torna o token antigo seguro novamente.
 
+## Configuração exata no Coolify
+
+1. Crie um recurso do tipo **Application** usando o repositório
+   `https://github.com/sonyddr666/codex-image-telegram` e a branch `main`.
+2. Selecione **Dockerfile** como build pack. O Dockerfile fica em `/Dockerfile` e o
+   diretório base é `/`.
+3. Este bot usa polling do Telegram: ele **não expõe porta HTTP**, não precisa de domínio e
+   não precisa de health check por URL. Remova qualquer domínio/porta gerado automaticamente.
+4. Em **Environment Variables**, adicione `TELEGRAM_BOT_TOKEN` com o token novo. Marque
+   somente **Available at Runtime**; deixe **Available at Buildtime** desmarcado.
+5. Adicione `ALLOWED_TELEGRAM_USER_IDS` com seu ID numérico do Telegram. Separe vários IDs
+   por vírgula.
+6. Em **Persistent Storage**, crie um volume e monte-o em `/app/data`. Sem esse volume, as
+   contas importadas e as imagens desaparecem quando o container for recriado.
+7. Salve as configurações e faça **Deploy**. Nos logs da aplicação deve aparecer
+   `Iniciando codex-telegram-unificado`, sem `Traceback` e sem o token.
+
+Configuração recomendada das variáveis:
+
+```text
+TELEGRAM_BOT_TOKEN       Buildtime: não | Runtime: sim
+DATA_DIR=/app/data       Buildtime: não | Runtime: sim
+DEFAULT_MODEL            Buildtime: não | Runtime: sim
+IMAGE_MODEL              Buildtime: não | Runtime: sim
+MAX_IMAGES               Buildtime: não | Runtime: sim
+ALLOWED_TELEGRAM_USER_IDS Buildtime: não | Runtime: sim
+```
+
+Se preferir criar um recurso **Docker Compose**, use o `docker-compose.yml` da raiz. Não
+configure simultaneamente o modo Dockerfile e o modo Compose para a mesma aplicação.
+
 ## Deploy com Docker Compose
 
 1. Copie `.env.example` para `.env` apenas no servidor/local e preencha o token novo.
@@ -118,3 +149,19 @@ docker compose config
 O cliente preserva os endpoints utilizados pelo projeto original para chat, quota e imagem.
 Esses endpoints de backend podem mudar; para integrações novas e estáveis, acompanhe a
 documentação oficial do Codex App Server e da API OpenAI.
+
+## Solução de problemas
+
+- **Exited / Restarting:** abra os logs da aplicação, não apenas Deployment Logs. Procure a
+  última linha do traceback.
+- **Device code indisponível:** habilite device code na segurança da conta ChatGPT ou peça ao
+  administrador do workspace. Como alternativa, use PKCE ou importe `auth.json`.
+- **Unauthorized / token inválido no Telegram:** gere um token novo no BotFather e atualize a
+  variável de runtime.
+- **Conflict: terminated by other getUpdates request:** há outra instância usando o mesmo bot.
+  Deixe apenas um container/processo ativo.
+- **Contas somem após deploy:** confirme o volume persistente montado exatamente em
+  `/app/data`.
+- **Imagem retorna 403:** a conta selecionada não possui acesso ao recurso de imagens.
+- **Build mostra `ARG TELEGRAM_BOT_TOKEN`:** a variável ainda está marcada como Buildtime no
+  Coolify. Desmarque, salve e faça novo deploy.
